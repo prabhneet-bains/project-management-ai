@@ -20,6 +20,12 @@ Per run, two stages:
 
 A developer ticket created in stage 1 is worked in stage 2 of the same run.
 
+One repository holds every project. Each piece of work is checked in under
+<project>/<use-case>/ (optionally below OUTPUT_ROOT). The PM agent takes the two
+names from "Project:" and "Use case:" lines in the intake ticket (falling back to
+the Jira project key and the ticket summary) and writes the result into the
+developer ticket as a "Repository folder:" line, which the Developer follows.
+
 Identities: each agent logs in as its own account.
   PM agent    PM_JIRA_EMAIL + PM_JIRA_API_TOKEN: everything in stage 1
               (needs Confluence write and Jira create-issue permission).
@@ -169,7 +175,7 @@ def load_config() -> Config:
     github_token = _env("DEV_GH_PAT", _env("GH_MACHINE_PAT"))
     if working and not github_token:
         raise SystemExit("Missing the Developer's GitHub token: set DEV_GH_PAT")
-    output_root = _env("OUTPUT_ROOT", "ai-generated").strip("/")
+    output_root = _env("OUTPUT_ROOT").strip("/")
     if output_root == ".":
         output_root = ""
 
@@ -546,6 +552,31 @@ def _adf_para(*nodes: dict) -> dict:
     return {"type": "paragraph", "content": list(nodes)}
 
 
+def slugify(text: str, fallback: str = "general") -> str:
+    """Lower-case folder-safe name: letters, digits and single hyphens only."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:50].strip("-")
+    return slug or fallback
+
+
+def field_line(text: str, name: str) -> str:
+    """Value of a 'Name: value' line in ticket text, or ''."""
+    match = re.search(rf"(?im)^\s*{re.escape(name)}\s*:\s*(.+?)\s*$", text or "")
+    return match.group(1) if match else ""
+
+
+def repo_folder(description: str, key: str, summary: str) -> str:
+    """<project>/<use-case> for a ticket; every segment is re-slugged so ticket text cannot escape it."""
+    stated = field_line(description, "Repository folder")
+    if stated:
+        parts = [slugify(p, "") for p in stated.replace("\\", "/").split("/")]
+        parts = [p for p in parts if p][:4]
+        if parts:
+            return "/".join(parts)
+    project = field_line(description, "Project") or key.rsplit("-", 1)[0]
+    use_case = field_line(description, "Use case") or re.sub(r"^\[DEV\]\s*", "", summary)
+    return f"{slugify(project)}/{slugify(use_case, slugify(key))}"
+
+
 def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -773,7 +804,7 @@ def build_context(cfg: Config, atl: Atlassian, key: str, fields: dict) -> tuple[
     return truncate("\n\n".join(sections), cfg.max_context_chars), page_ids
 
 
-def write_handoff(cfg: Config, key: str, summary: str, spec: str) -> None:
+def write_handoff(cfg: Config, key: str, summary: str, spec: str, folder: str) -> None:
     """Save the specification for the workflow's Claude Developer job."""
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", key):  # the key becomes a branch name and a path
         raise RuntimeError(f"Unexpected ticket key format: {key!r}")
@@ -781,7 +812,12 @@ def write_handoff(cfg: Config, key: str, summary: str, spec: str) -> None:
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, "SPEC.md"), "w", encoding="utf-8") as fh:
         fh.write(spec.strip() + "\n")
-    meta = {"key": key, "summary": summary, "ticket_url": f"{cfg.jira_base_url}/browse/{key}"}
+    meta = {
+        "key": key,
+        "summary": summary,
+        "ticket_url": f"{cfg.jira_base_url}/browse/{key}",
+        "folder": folder,
+    }
     with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh)
 
@@ -803,6 +839,11 @@ def pm_process_ticket(cfg: Config, pm: Atlassian, issue: dict) -> str | None:
     log.info("=== PM: %s: %s ===", key, summary)
 
     context, page_ids = build_context(cfg, pm, key, fields)
+    folder = repo_folder(adf_to_text(fields.get("description")), key, summary)
+    context = (
+        f"## Repository layout\nOne repository holds every project. This work lives in the folder "
+        f"`{folder}/`. Give all file paths relative to that folder.\n\n{context}"
+    )
     spec = researcher_agent(cfg, key, summary, issue_type, context)
     log.info("%s: PM agent produced a %d-char specification", key, len(spec))
     if cfg.dry_run:
@@ -827,6 +868,7 @@ def pm_process_ticket(cfg: Config, pm: Atlassian, issue: dict) -> str | None:
         "content": [
             _adf_para(_adf_text("Developer ticket created by the PM agent for "), _adf_text(key, ticket_url)),
             _adf_para(_adf_text("Technical specification (Confluence): "), _adf_text(spec_url, spec_url)),
+            _adf_para(_adf_text(f"Repository folder: {folder}")),
             {"type": "heading", "attrs": {"level": 3}, "content": [_adf_text("Technical specification")]},
             {"type": "codeBlock", "content": [_adf_text(truncate(spec.strip(), 30000))]},
         ],
@@ -899,7 +941,10 @@ def process_ticket(cfg: Config, dev: Atlassian, repo: Any, issue: dict, handoff:
         spec = adf_to_text(fields.get("description")).strip()
         if not spec:
             raise RuntimeError("The ticket has no description, so there is nothing to build.")
+        folder = repo_folder(spec, key, summary)
+        prefix = "/".join(part for part in (cfg.output_root, folder) if part)
         spec = truncate(spec, 30000)
+        log.info("%s: repository folder %s/", key, prefix)
         engine = "Claude" if cfg.developer_engine == "claude" else "free tier"
 
         if not cfg.dry_run:
@@ -912,7 +957,7 @@ def process_ticket(cfg: Config, dev: Atlassian, repo: Any, issue: dict, handoff:
             if cfg.dry_run:
                 print(f"\n----- {key} SPEC (Claude Developer would implement this) -----\n{spec}\n")
                 return "(dry run - nothing written)"
-            write_handoff(cfg, key, summary, spec)
+            write_handoff(cfg, key, summary, spec, prefix)
             handoff.append(key)
             log.info("%s: specification handed off to the Claude Developer job", key)
             return "(handed off)"
@@ -920,9 +965,8 @@ def process_ticket(cfg: Config, dev: Atlassian, repo: Any, issue: dict, handoff:
         files, dev_summary = developer_agent(cfg, key, spec)
         log.info("%s: Developer produced %d file(s): %s", key, len(files), ", ".join(files))
 
-        prefix = f"{cfg.output_root}/{key}" if cfg.output_root else ""
-        repo_files = {(f"{prefix}/{p}" if prefix else p): c for p, c in files.items()}
-        repo_files[f"{prefix}/SPEC.md" if prefix else f"docs/specs/{key}.md"] = spec.strip() + "\n"
+        repo_files = {f"{prefix}/{p}": c for p, c in files.items()}
+        repo_files[f"{prefix}/specs/{key}.md"] = spec.strip() + "\n"
 
         if cfg.dry_run:
             log.info("DRY_RUN: would commit %s", sorted(repo_files))
