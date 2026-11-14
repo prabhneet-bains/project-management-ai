@@ -15,6 +15,13 @@ The agents are an API-direct prompt chain against an OpenAI-compatible
 chat-completions endpoint (Groq by default, Gemini optional), so the only
 dependencies are `requests` and `PyGithub`.
 
+Identities: each agent logs in as its own account.
+  Researcher (PM/BA)  PM_JIRA_EMAIL + PM_JIRA_API_TOKEN: reads tickets and Confluence,
+                      comments when the specification is ready, records failures.
+  Developer           DEV_JIRA_EMAIL + DEV_JIRA_API_TOKEN: comments the PR link and
+                      moves the ticket to Done. DEV_GH_PAT: opens the pull request.
+  (JIRA_EMAIL / JIRA_API_TOKEN / GH_MACHINE_PAT are still read as a shared fallback.)
+
 Developer switch (DEVELOPER_ENGINE):
   gemini (default)  Steps 4-6 run here, with the Developer on the Gemini free tier.
   claude            This script stops after step 3 and writes each specification to
@@ -77,8 +84,10 @@ def _env(name: str, default: str = "", required: bool = False) -> str:
 @dataclass
 class Config:
     jira_base_url: str
-    jira_email: str
-    jira_api_token: str
+    pm_jira_email: str
+    pm_jira_api_token: str
+    dev_jira_email: str
+    dev_jira_api_token: str
     confluence_base_url: str
     jira_project_key: str
     jira_todo_status: str
@@ -138,14 +147,30 @@ def load_config() -> Config:
             )
 
     jira_base = _env("JIRA_BASE_URL", required=True).rstrip("/")
+    dry_run = _env("DRY_RUN", "false").lower() in ("1", "true", "yes")
+
+    # One Atlassian login per agent; JIRA_EMAIL / JIRA_API_TOKEN is a shared fallback.
+    pm_email = _env("PM_JIRA_EMAIL", _env("JIRA_EMAIL"))
+    pm_token = _env("PM_JIRA_API_TOKEN", _env("JIRA_API_TOKEN"))
+    dev_email = _env("DEV_JIRA_EMAIL", _env("JIRA_EMAIL"))
+    dev_token = _env("DEV_JIRA_API_TOKEN", _env("JIRA_API_TOKEN"))
+    if working and not (pm_email and pm_token):
+        raise SystemExit("Missing the Researcher's Jira login: set PM_JIRA_EMAIL and PM_JIRA_API_TOKEN")
+    if not dry_run and not (dev_email and dev_token):
+        raise SystemExit("Missing the Developer's Jira login: set DEV_JIRA_EMAIL and DEV_JIRA_API_TOKEN")
+    github_token = _env("DEV_GH_PAT", _env("GH_MACHINE_PAT"))
+    if working and not github_token:
+        raise SystemExit("Missing the Developer's GitHub token: set DEV_GH_PAT")
     output_root = _env("OUTPUT_ROOT", "ai-generated").strip("/")
     if output_root == ".":
         output_root = ""
 
     return Config(
         jira_base_url=jira_base,
-        jira_email=_env("JIRA_EMAIL", required=True),
-        jira_api_token=_env("JIRA_API_TOKEN", required=True),
+        pm_jira_email=pm_email,
+        pm_jira_api_token=pm_token,
+        dev_jira_email=dev_email,
+        dev_jira_api_token=dev_token,
         confluence_base_url=_env("CONFLUENCE_BASE_URL", f"{jira_base}/wiki").rstrip("/"),
         jira_project_key=_env("JIRA_PROJECT_KEY"),
         jira_todo_status=_env("JIRA_TODO_STATUS", "To Do"),
@@ -163,13 +188,13 @@ def load_config() -> Config:
         phase=phase,
         handoff_dir=_env("HANDOFF_DIR", "handoff"),
         max_context_chars=int(_env("MAX_CONTEXT_CHARS", "10000")),
-        github_token=_env("GH_MACHINE_PAT", required=working),
+        github_token=github_token,
         target_repo=_env("TARGET_REPO", required=working),
         base_branch=_env("BASE_BRANCH"),
         output_root=output_root,
         max_tickets=int(_env("MAX_TICKETS_PER_RUN", "3")),
         max_confluence_pages=int(_env("MAX_CONFLUENCE_PAGES", "5")),
-        dry_run=_env("DRY_RUN", "false").lower() in ("1", "true", "yes"),
+        dry_run=dry_run,
     )
 
 
@@ -178,12 +203,13 @@ def load_config() -> Config:
 # --------------------------------------------------------------------------- #
 
 class Atlassian:
-    """Minimal Jira Cloud v3 / Confluence Cloud v2 REST client (email + API token)."""
+    """Minimal Jira Cloud v3 / Confluence Cloud v2 REST client, logged in as one agent."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, email: str, api_token: str):
         self.cfg = cfg
+        self.email = email
         self.session = requests.Session()
-        self.session.auth = (cfg.jira_email, cfg.jira_api_token)
+        self.session.auth = (email, api_token)
         self.session.headers.update({"Accept": "application/json"})
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
@@ -624,12 +650,23 @@ def emit_handoff(keys: list[str]) -> None:
             fh.write(f"tickets={json.dumps(keys)}\n")
 
 
+def announce_spec(cfg: Config, pm: Atlassian, key: str) -> None:
+    """Researcher's own Jira comment, so the ticket history shows who did which step."""
+    engine = "Claude" if cfg.developer_engine == "claude" else "free tier"
+    try:
+        pm.add_comment(
+            key, f"Researcher agent: technical specification written and handed to the Developer agent ({engine})."
+        )
+    except Exception as exc:  # traceability only; never fail the ticket over it
+        log.warning("%s: could not post the Researcher's comment: %s", key, exc)
+
+
 def finish_ticket(cfg: Config, atl: Atlassian) -> int:
-    """AGENT_PHASE=finalize|fail: record the Claude Developer job's result on one ticket."""
+    """AGENT_PHASE=finalize|fail: the Developer records the Claude job's result on one ticket."""
     key = _env("TICKET_KEY", required=True)
     if cfg.phase == "finalize":
         pr_url = _env("PR_URL", required=True)
-        atl.add_comment(key, "AI agents (Claude Developer) opened a pull request for this ticket:", pr_url)
+        atl.add_comment(key, "Developer agent (Claude) opened a pull request for this ticket:", pr_url)
         atl.transition(key, cfg.jira_done_status)
         log.info("%s: commented and transitioned to %s", key, cfg.jira_done_status)
     else:
@@ -645,7 +682,9 @@ def finish_ticket(cfg: Config, atl: Atlassian) -> int:
     return 0
 
 
-def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff: list[str]) -> str:
+def process_ticket(
+    cfg: Config, pm: Atlassian, dev: Atlassian, repo: Any, issue: dict, handoff: list[str]
+) -> str:
     key = issue["key"]
     fields = issue.get("fields") or {}
     summary = (fields.get("summary") or key).strip()
@@ -657,7 +696,7 @@ def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff:
     if pr_url:
         log.info("%s: open PR already exists (%s); skipping generation", key, pr_url)
     else:
-        context = build_context(cfg, atl, key, fields)
+        context = build_context(cfg, pm, key, fields)
         spec = researcher_agent(cfg, key, summary, issue_type, context)
         log.info("%s: Researcher produced a %d-char specification", key, len(spec))
 
@@ -667,6 +706,7 @@ def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff:
                 return "(dry run - nothing written)"
             write_handoff(cfg, key, summary, spec)
             handoff.append(key)
+            announce_spec(cfg, pm, key)
             log.info("%s: specification handed off to the Claude Developer job", key)
             return "(handed off)"
 
@@ -684,6 +724,7 @@ def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff:
                 print(f"----- {key} FILE {path} -----\n{content}")
             return "(dry run - nothing written)"
 
+        announce_spec(cfg, pm, key)
         ticket_url = f"{cfg.jira_base_url}/browse/{key}"
         file_list = "\n".join(f"- `{p}`" for p in sorted(repo_files))
         pr_body = (
@@ -695,8 +736,8 @@ def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff:
         pr_url = publish_pull_request(cfg, repo, key, summary, repo_files, pr_body)
         log.info("%s: opened %s", key, pr_url)
 
-    atl.add_comment(key, "AI agents opened a pull request for this ticket:", pr_url)
-    atl.transition(key, cfg.jira_done_status)
+    dev.add_comment(key, "Developer agent opened a pull request for this ticket:", pr_url)
+    dev.transition(key, cfg.jira_done_status)
     log.info("%s: commented and transitioned to %s", key, cfg.jira_done_status)
     return pr_url
 
@@ -704,9 +745,11 @@ def process_ticket(cfg: Config, atl: Atlassian, repo: Any, issue: dict, handoff:
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
-    atl = Atlassian(cfg)
+    dev = Atlassian(cfg, cfg.dev_jira_email, cfg.dev_jira_api_token)
     if cfg.phase != "run":
-        return finish_ticket(cfg, atl)
+        return finish_ticket(cfg, dev)
+    pm = atl = Atlassian(cfg, cfg.pm_jira_email, cfg.pm_jira_api_token)
+    log.info("Researcher logs in to Jira as %s; Developer as %s", pm.email, dev.email or "(not set - dry run)")
     log.info(
         "Developer engine: %s",
         "claude (workflow job)" if cfg.developer_engine == "claude" else f"free tier, model {cfg.dev_llm_model}",
@@ -728,7 +771,7 @@ def main() -> int:
     for issue in issues:
         key = issue.get("key", "?")
         try:
-            process_ticket(cfg, atl, repo, issue, handoff)
+            process_ticket(cfg, pm, dev, repo, issue, handoff)
         except Exception as exc:
             failures += 1
             log.exception("%s: failed", key)

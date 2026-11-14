@@ -32,8 +32,13 @@ env:
   TARGET_REPO: ${{ vars.TARGET_REPO || github.repository }}   # owner/repo that receives PRs
   # --- Jira (Settings > Secrets and variables > Actions) ---
   JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}       # https://yourcompany.atlassian.net
-  JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-  JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  # Each agent logs in to Jira/Confluence as its own account.
+  # Researcher (PM/BA): reads tickets and Confluence, comments when the spec is ready.
+  PM_JIRA_EMAIL: ${{ secrets.PM_JIRA_EMAIL || secrets.JIRA_EMAIL }}
+  PM_JIRA_API_TOKEN: ${{ secrets.PM_JIRA_API_TOKEN || secrets.JIRA_API_TOKEN }}
+  # Developer: comments the PR link and moves the ticket to Done.
+  DEV_JIRA_EMAIL: ${{ secrets.DEV_JIRA_EMAIL || secrets.JIRA_EMAIL }}
+  DEV_JIRA_API_TOKEN: ${{ secrets.DEV_JIRA_API_TOKEN || secrets.JIRA_API_TOKEN }}
   JIRA_DONE_STATUS: ${{ vars.JIRA_DONE_STATUS }}    # default: Done
 
 jobs:
@@ -70,7 +75,7 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}           # Researcher: Groq (or Gemini) API key
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}     # Developer in gemini mode (not needed if LLM_PROVIDER=gemini)
-          GH_MACHINE_PAT: ${{ secrets.GH_MACHINE_PAT }}     # machine-user PAT for the target repo
+          DEV_GH_PAT: ${{ secrets.DEV_GH_PAT || secrets.GH_MACHINE_PAT }}   # the Developer's GitHub token for the target repo
           # --- Optional variables; blanks fall back to defaults ---
           BASE_BRANCH: ${{ vars.BASE_BRANCH }}              # default: repo default branch
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}            # groq (default) | gemini
@@ -120,7 +125,7 @@ jobs:
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ vars.BASE_BRANCH }}
-          token: ${{ secrets.GH_MACHINE_PAT }}
+          token: ${{ secrets.DEV_GH_PAT || secrets.GH_MACHINE_PAT }}
           persist-credentials: false
 
       - name: Fetch the specification
@@ -141,7 +146,7 @@ jobs:
           # (create it with `claude setup-token`); the API key is billed per token.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GH_MACHINE_PAT }}
+          github_token: ${{ secrets.DEV_GH_PAT || secrets.GH_MACHINE_PAT }}
           prompt: |
             You are the Developer on a small software team. Implement the technical
             specification in docs/specs/${{ matrix.ticket }}.md inside this repository.
@@ -161,7 +166,7 @@ jobs:
       - name: Commit, push and open the pull request
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.GH_MACHINE_PAT }}
+          GH_TOKEN: ${{ secrets.DEV_GH_PAT || secrets.GH_MACHINE_PAT }}
           BASE_BRANCH: ${{ vars.BASE_BRANCH }}
           GIT_NAME: ${{ vars.AGENT_GIT_NAME || 'dev-agent' }}
           GIT_EMAIL: ${{ vars.AGENT_GIT_EMAIL || 'dev-agent@users.noreply.github.com' }}
