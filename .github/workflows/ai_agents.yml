@@ -40,6 +40,9 @@ env:
   DEV_JIRA_EMAIL: ${{ secrets.DEV_JIRA_EMAIL || secrets.JIRA_EMAIL }}
   DEV_JIRA_API_TOKEN: ${{ secrets.DEV_JIRA_API_TOKEN || secrets.JIRA_API_TOKEN }}
   JIRA_DONE_STATUS: ${{ vars.JIRA_DONE_STATUS }}    # default: Done
+  # Only needed when Confluence is on a different Atlassian site from Jira,
+  # e.g. https://other-site.atlassian.net/wiki. Default: <JIRA_BASE_URL>/wiki
+  CONFLUENCE_BASE_URL: ${{ vars.CONFLUENCE_BASE_URL }}
 
 jobs:
   # The PM agent always runs here on the free tier. With DEVELOPER_ENGINE=gemini the
